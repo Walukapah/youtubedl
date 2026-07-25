@@ -1,21 +1,18 @@
 FROM python:3.11-slim
 
-WORKDIR /app
-
+# ffmpeg install කරනවා (video/audio merge කරන්න && MP3 convert කරන්න)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    curl \
     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --upgrade yt-dlp
 
-# cookies.txt file එක copy කරනවා
-COPY cookies.txt /app/cookies.txt
+COPY . .
 
-COPY main.py .
+ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render PORT env variable එක use කරනවා
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --timeout 300 --workers 2 app:app"]
