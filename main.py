@@ -3,7 +3,6 @@ import re
 import shutil
 import uuid
 import logging
-import json
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,10 +11,7 @@ import yt_dlp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="YouTube Downloader API",
-    version="2.1.0",
-)
+app = FastAPI(title="YouTube Downloader API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,17 +23,27 @@ app.add_middleware(
 
 # ==================== Config ====================
 
-COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+COOKIES_FILE = "/app/cookies.txt"
+COOKIES_DATA = os.getenv("COOKIES_DATA", "")
+
+# Hugging Face Secret එකකින් cookies.txt හදනවා
+if COOKIES_DATA and not os.path.exists(COOKIES_FILE):
+    try:
+        with open(COOKIES_FILE, "w") as f:
+            f.write(COOKIES_DATA)
+        logger.info("✅ cookies.txt created from COOKIES_DATA secret")
+    except Exception as e:
+        logger.error(f"Failed to write cookies: {e}")
+
 PO_TOKEN = os.getenv("PO_TOKEN", "")
 VISITOR_DATA = os.getenv("VISITOR_DATA", "")
 PROXY_URL = os.getenv("PROXY_URL", "")
 
 def get_base_ydl_opts():
-    """Base yt-dlp options with auth"""
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.0",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "referer": "https://www.youtube.com/",
         "headers": {
             "Accept-Language": "en-US,en;q=0.9",
@@ -45,14 +51,13 @@ def get_base_ydl_opts():
         }
     }
 
-    # Method 1: Cookies file
+    # Method 1: Cookies file (BEST with your uploaded file)
     if os.path.exists(COOKIES_FILE):
-        logger.info(f"Using cookies file: {COOKIES_FILE}")
+        logger.info(f"✅ Using cookies file: {COOKIES_FILE}")
         opts["cookies"] = COOKIES_FILE
-
-    # Method 2: PO Token + Visitor Data (BEST for servers)
-    if PO_TOKEN and VISITOR_DATA:
-        logger.info("Using PO Token + Visitor Data")
+    # Method 2: PO Token + Visitor Data
+    elif PO_TOKEN and VISITOR_DATA:
+        logger.info("✅ Using PO Token + Visitor Data")
         opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["web"],
@@ -61,10 +66,16 @@ def get_base_ydl_opts():
                 "visitor_data": [VISITOR_DATA],
             }
         }
+    # Method 3: Android client fallback
+    else:
+        logger.warning("⚠️ No auth configured! Using Android fallback...")
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        }
 
-    # Method 3: Proxy
     if PROXY_URL:
-        logger.info(f"Using proxy: {PROXY_URL}")
         opts["proxy"] = PROXY_URL
 
     return opts
@@ -172,7 +183,7 @@ def get_available_formats(url):
             err = str(e)
             logger.error(f"yt-dlp error: {err}")
             if "Sign in to confirm" in err:
-                return None, "YOUTUBE_BOT_DETECTED: YouTube detected bot. Need cookies or PO token. See /docs for setup."
+                return None, "YOUTUBE_BOT_DETECTED: Cookies expired or invalid. Re-export cookies.txt from browser."
             return None, f"yt-dlp error: {err}"
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -192,55 +203,20 @@ def sanitize_filename(name):
 
 @app.get("/")
 async def root():
+    cookies_exists = os.path.exists(COOKIES_FILE)
+    cookies_size = os.path.getsize(COOKIES_FILE) if cookies_exists else 0
+    
     return {
         "status": "running",
         "yt_dlp_version": yt_dlp.version.__version__,
-        "auth_methods": {
-            "cookies_file": os.path.exists(COOKIES_FILE),
+        "auth_configured": {
+            "cookies_file_exists": cookies_exists,
+            "cookies_file_size_bytes": cookies_size,
             "po_token": bool(PO_TOKEN),
             "visitor_data": bool(VISITOR_DATA),
             "proxy": bool(PROXY_URL),
         },
         "docs": "/docs",
-        "setup_guide": "/setup"
-    }
-
-@app.get("/setup")
-async def setup_guide():
-    return {
-        "problem": "YouTube detects server IPs as bots and requires authentication",
-        "solutions": [
-            {
-                "method": "PO_TOKEN + VISITOR_DATA (RECOMMENDED)",
-                "description": "Most reliable for servers. No browser needed.",
-                "steps": [
-                    "1. Open YouTube in Chrome browser",
-                    "2. Press F12 → Console tab",
-                    "3. Paste: document.cookie.split(';').find(c => c.trim().startsWith('VISITOR_INFO1_LIVE='))?.split('=')[1]",
-                    "4. Copy the value → set as VISITOR_DATA env var",
-                    "5. For PO Token, use: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#po-token-guide",
-                    "6. Or use: https://github.com/YunzhiYike/yt-dlp-po-token"
-                ],
-                "docker_env": "-e PO_TOKEN=your_token -e VISITOR_DATA=your_visitor_data"
-            },
-            {
-                "method": "Cookies File",
-                "description": "Export cookies from your browser",
-                "steps": [
-                    "1. Install 'Get cookies.txt LOCALLY' Chrome extension",
-                    "2. Go to youtube.com and sign in",
-                    "3. Click extension → Export cookies.txt",
-                    "4. Save as cookies.txt",
-                    "5. Mount to /app/cookies.txt in Docker"
-                ],
-                "docker_volume": "-v $(pwd)/cookies.txt:/app/cookies.txt"
-            },
-            {
-                "method": "Proxy",
-                "description": "Route through residential proxy",
-                "docker_env": "-e PROXY_URL=http://user:pass@proxy:port"
-            }
-        ]
     }
 
 @app.get("/youtube")
@@ -366,7 +342,7 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
             display_quality = quality
             ext_hint = f".{best_combined['ext']}"
 
-        logger.info(f"Downloading video: {ydl_opts}")
+        logger.info(f"Downloading video: {ydl_opts.get('format')}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -439,7 +415,7 @@ async def download_audio(
             display_suffix = f"{int(selected_audio['abr']) if selected_audio['abr'] else '?'}kbps"
             ext_hint = f".{selected_audio['ext']}"
 
-        logger.info(f"Downloading audio: {ydl_opts}")
+        logger.info(f"Downloading audio: {ydl_opts.get('format')}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -486,10 +462,8 @@ async def debug_ytdl(url: str):
                 "formats_count": len(info.get("formats", [])),
                 "yt_dlp_version": yt_dlp.version.__version__,
                 "auth_active": {
-                    "cookies": os.path.exists(COOKIES_FILE),
-                    "po_token": bool(PO_TOKEN),
-                    "visitor_data": bool(VISITOR_DATA),
-                    "proxy": bool(PROXY_URL),
+                    "cookies_file": os.path.exists(COOKIES_FILE),
+                    "cookies_size": os.path.getsize(COOKIES_FILE) if os.path.exists(COOKIES_FILE) else 0,
                 }
             }
     except Exception as e:
@@ -497,11 +471,8 @@ async def debug_ytdl(url: str):
             "success": False,
             "error": str(e),
             "error_type": type(e).__name__,
-            "yt_dlp_version": yt_dlp.version.__version__,
             "auth_active": {
-                "cookies": os.path.exists(COOKIES_FILE),
-                "po_token": bool(PO_TOKEN),
-                "visitor_data": bool(VISITOR_DATA),
-                "proxy": bool(PROXY_URL),
+                "cookies_file": os.path.exists(COOKIES_FILE),
+                "cookies_size": os.path.getsize(COOKIES_FILE) if os.path.exists(COOKIES_FILE) else 0,
             }
         }
