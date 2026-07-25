@@ -25,11 +25,7 @@ else:
 
 
 def get_base_ydl_opts():
-    """Base yt-dlp options with cookies support"""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-    }
+    opts = {"quiet": True, "no_warnings": True}
     if COOKIES_AVAILABLE:
         opts["cookiefile"] = COOKIES_PATH
     return opts
@@ -92,6 +88,15 @@ def get_info(url):
         return ydl.extract_info(url, download=False)
 
 
+def safe_int(val, default=0):
+    try:
+        return int(val) if val is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+# ============ Routes ============
+
 @app.route('/')
 def index():
     return jsonify({
@@ -123,8 +128,8 @@ def list_formats():
                 if not height or height <= 0:
                     continue
                 std_height = map_to_standard_quality(height)
-                fps = fmt.get("fps", 0)
-                quality_key = f"{std_height}p" + (f"{int(fps)}" if fps and fps > 30 else "")
+                fps = safe_int(fmt.get("fps"), 0)
+                quality_key = f"{std_height}p" + (f"{fps}" if fps > 30 else "")
 
                 if quality_key not in video_formats:
                     video_formats[quality_key] = []
@@ -151,7 +156,7 @@ def list_formats():
                 "quality": q,
                 "format_id": best.get("format_id"),
                 "ext": best.get("ext", "unknown"),
-                "fps": best.get("fps", 30),
+                "fps": safe_int(best.get("fps"), 30),
                 "size_mb": round(size_mb, 1) if size_mb else None,
                 "vcodec": best.get("vcodec", "unknown")
             })
@@ -230,68 +235,126 @@ def download_video():
         info = get_info(url)
         title = info.get("title", "video")
         safe_title = re.sub(r'[^\w\s-]', '', title).strip() or "video"
-
-        formats = info.get("formats", [])
-
-        # Try combined format first
-        combined_match = None
-        for fmt in formats:
-            if fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
-                h = fmt.get("height", 0)
-                if h and map_to_standard_quality(h) == parse_quality_key(quality)[0]:
-                    if not combined_match or fmt.get("format_id", "0") > combined_match.get("format_id", "0"):
-                        combined_match = fmt
-
-        # Try video-only format
-        video_match = None
-        for fmt in formats:
-            if fmt.get("vcodec") != "none" and fmt.get("acodec") == "none":
-                h = fmt.get("height", 0)
-                std_h = map_to_standard_quality(h)
-                fps = fmt.get("fps", 0)
-                qk = f"{std_h}p" + (f"{int(fps)}" if fps and fps > 30 else "")
-                if qk == quality:
-                    if not video_match or (fmt.get("ext") == "mp4" and video_match.get("ext") != "mp4"):
-                        video_match = fmt
-
         download_id = str(uuid.uuid4())
         base_opts = get_base_ydl_opts()
 
-        if combined_match and not video_match:
-            ydl_opts = {
-                **base_opts,
-                'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
-                'format': combined_match["format_id"],
-                'noplaylist': True,
-            }
+        target_height, target_fps = parse_quality_key(quality)
+        filepath = None
 
-        elif video_match:
+        # ===== Strategy 1: Use yt-dlp format selector by height (MOST RELIABLE) =====
+        try:
+            if target_height > 0:
+                # Build format selector: prefer exact height, mp4, then fallback
+                if target_fps > 30:
+                    fmt_selector = (
+                        f"bestvideo[height={target_height}][fps>30][ext=mp4]+bestaudio/"
+                        f"bestvideo[height={target_height}][fps>30]+bestaudio/"
+                        f"bestvideo[height={target_height}][ext=mp4]+bestaudio/"
+                        f"bestvideo[height={target_height}]+bestaudio/"
+                        f"best[height={target_height}]"
+                    )
+                else:
+                    fmt_selector = (
+                        f"bestvideo[height={target_height}][ext=mp4]+bestaudio/"
+                        f"bestvideo[height={target_height}]+bestaudio/"
+                        f"best[height={target_height}]"
+                    )
+            else:
+                fmt_selector = "bestvideo+bestaudio/best"
+
             ydl_opts = {
                 **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
-                'format': f"{video_match['format_id']}+bestaudio/best",
+                'format': fmt_selector,
                 'merge_output_format': 'mp4',
                 'noplaylist': True,
             }
 
-        else:
-            ydl_opts = {
-                **base_opts,
-                'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
-                'format': 'best',
-                'noplaylist': True,
-            }
+            print(f"[VIDEO] Trying format selector: {fmt_selector}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
+            if files:
+                filepath = files[0]
+                print(f"[VIDEO] Success with format selector")
 
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
-        if not files:
+        except Exception as e1:
+            print(f"[VIDEO] Format selector failed: {e1}")
+            # Clean up partial files
+            for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*")):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+        # ===== Strategy 2: Try exact format_id from info =====
+        if not filepath:
+            try:
+                formats = info.get("formats", [])
+                best_fmt = None
+
+                for fmt in formats:
+                    h = fmt.get("height", 0)
+                    if not h:
+                        continue
+                    std_h = map_to_standard_quality(h)
+                    fps = safe_int(fmt.get("fps"), 0)
+                    qk = f"{std_h}p" + (f"{fps}" if fps > 30 else "")
+                    if qk == quality:
+                        if not best_fmt or (fmt.get("ext") == "mp4" and best_fmt.get("ext") != "mp4"):
+                            best_fmt = fmt
+
+                if best_fmt:
+                    new_id = str(uuid.uuid4())
+                    ydl_opts = {
+                        **base_opts,
+                        'outtmpl': os.path.join(DOWNLOAD_DIR, f'{new_id}.%(ext)s'),
+                        'format': f"{best_fmt['format_id']}+bestaudio/best",
+                        'merge_output_format': 'mp4',
+                        'noplaylist': True,
+                    }
+                    print(f"[VIDEO] Trying exact format_id: {best_fmt['format_id']}")
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+
+                    files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{new_id}.*"))
+                    if files:
+                        filepath = files[0]
+                        download_id = new_id
+                        print(f"[VIDEO] Success with exact format_id")
+
+            except Exception as e2:
+                print(f"[VIDEO] Exact format_id failed: {e2}")
+
+        # ===== Strategy 3: Fallback to best available =====
+        if not filepath:
+            try:
+                new_id = str(uuid.uuid4())
+                ydl_opts = {
+                    **base_opts,
+                    'outtmpl': os.path.join(DOWNLOAD_DIR, f'{new_id}.%(ext)s'),
+                    'format': 'bestvideo+bestaudio/best',
+                    'merge_output_format': 'mp4',
+                    'noplaylist': True,
+                }
+                print(f"[VIDEO] Falling back to best available")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+
+                files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{new_id}.*"))
+                if files:
+                    filepath = files[0]
+                    download_id = new_id
+                    print(f"[VIDEO] Success with fallback")
+
+            except Exception as e3:
+                return jsonify({"success": False, "error": f"All download strategies failed. Last error: {str(e3)}"}), 500
+
+        if not filepath or not os.path.exists(filepath):
             return jsonify({"success": False, "error": "Download failed - file not found"}), 500
 
-        filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
-
         cleanup_file(filepath)
 
         return send_file(
@@ -317,49 +380,90 @@ def download_audio():
         info = get_info(url)
         title = info.get("title", "audio")
         safe_title = re.sub(r'[^\w\s-]', '', title).strip() or "audio"
-
         download_id = str(uuid.uuid4())
         base_opts = get_base_ydl_opts()
+        filepath = None
 
+        # ===== Strategy 1: MP3 Conversion =====
         if type_.lower() == 'mp3':
-            ydl_opts = {
-                **base_opts,
-                'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'noplaylist': True,
-            }
+            try:
+                ydl_opts = {
+                    **base_opts,
+                    'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'noplaylist': True,
+                }
+                print(f"[AUDIO] Downloading MP3")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-        else:
-            if quality and quality != 'best':
+                files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
+                if files:
+                    filepath = files[0]
+                    print(f"[AUDIO] MP3 success")
+
+            except Exception as e1:
+                print(f"[AUDIO] MP3 failed: {e1}")
+
+        # ===== Strategy 2: Specific audio format by format_id =====
+        elif quality and quality != 'best':
+            try:
                 ydl_opts = {
                     **base_opts,
                     'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                     'format': quality,
                     'noplaylist': True,
                 }
-            else:
+                print(f"[AUDIO] Trying format_id: {quality}")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+
+                files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
+                if files:
+                    filepath = files[0]
+                    print(f"[AUDIO] format_id success")
+
+            except Exception as e2:
+                print(f"[AUDIO] format_id failed: {e2}")
+                # Clean up
+                for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*")):
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
+
+        # ===== Strategy 3: Fallback to best audio =====
+        if not filepath:
+            try:
+                new_id = str(uuid.uuid4())
                 ydl_opts = {
                     **base_opts,
-                    'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
+                    'outtmpl': os.path.join(DOWNLOAD_DIR, f'{new_id}.%(ext)s'),
                     'format': 'bestaudio/best',
                     'noplaylist': True,
                 }
+                print(f"[AUDIO] Falling back to best audio")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+                files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{new_id}.*"))
+                if files:
+                    filepath = files[0]
+                    download_id = new_id
+                    print(f"[AUDIO] Fallback success")
 
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
-        if not files:
+            except Exception as e3:
+                return jsonify({"success": False, "error": f"All audio download strategies failed. Last error: {str(e3)}"}), 500
+
+        if not filepath or not os.path.exists(filepath):
             return jsonify({"success": False, "error": "Download failed - file not found"}), 500
 
-        filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
-
         cleanup_file(filepath)
 
         return send_file(
