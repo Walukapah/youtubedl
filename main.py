@@ -3,19 +3,18 @@ import re
 import shutil
 import uuid
 import logging
+import json
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 
-# Logging setup - errors console එකේ පෙන්නනවා
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="YouTube Downloader API",
-    description="YouTube Video & Audio Downloader API powered by yt-dlp",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -26,39 +25,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== Helper Functions ====================
+# ==================== Config ====================
+
+COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+PO_TOKEN = os.getenv("PO_TOKEN", "")
+VISITOR_DATA = os.getenv("VISITOR_DATA", "")
+PROXY_URL = os.getenv("PROXY_URL", "")
+
+def get_base_ydl_opts():
+    """Base yt-dlp options with auth"""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.0",
+        "referer": "https://www.youtube.com/",
+        "headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        }
+    }
+
+    # Method 1: Cookies file
+    if os.path.exists(COOKIES_FILE):
+        logger.info(f"Using cookies file: {COOKIES_FILE}")
+        opts["cookies"] = COOKIES_FILE
+
+    # Method 2: PO Token + Visitor Data (BEST for servers)
+    if PO_TOKEN and VISITOR_DATA:
+        logger.info("Using PO Token + Visitor Data")
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web"],
+                "player_skip": ["webpage", "configs", "js"],
+                "po_token": [PO_TOKEN],
+                "visitor_data": [VISITOR_DATA],
+            }
+        }
+
+    # Method 3: Proxy
+    if PROXY_URL:
+        logger.info(f"Using proxy: {PROXY_URL}")
+        opts["proxy"] = PROXY_URL
+
+    return opts
+
+# ==================== Helpers ====================
 
 def parse_quality_key(q):
     match = re.match(r'(\d+)p(\d+)?', q)
     if match:
-        height = int(match.group(1))
-        fps = int(match.group(2)) if match.group(2) else 30
-        return (height, fps)
+        return (int(match.group(1)), int(match.group(2)) if match.group(2) else 30)
     return (0, 0)
 
 def map_to_standard_quality(height):
-    standard_qualities = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320]
-    closest = min(standard_qualities, key=lambda x: abs(x - height))
+    standard = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320]
+    closest = min(standard, key=lambda x: abs(x - height))
     if abs(closest - height) <= 20:
         return closest
-    if height <= 150:
-        return 144
-    elif height <= 280:
-        return 240
-    elif height <= 400:
-        return 360
-    elif height <= 560:
-        return 480
-    elif height <= 800:
-        return 720
-    elif height <= 1200:
-        return 1080
-    elif height <= 1800:
-        return 1440
-    elif height <= 2800:
-        return 2160
-    else:
-        return 4320
+    if height <= 150: return 144
+    elif height <= 280: return 240
+    elif height <= 400: return 360
+    elif height <= 560: return 480
+    elif height <= 800: return 720
+    elif height <= 1200: return 1080
+    elif height <= 1800: return 1440
+    elif height <= 2800: return 2160
+    else: return 4320
 
 def estimate_mp3_size(duration, bitrate=192):
     if not duration or duration <= 0:
@@ -66,27 +98,25 @@ def estimate_mp3_size(duration, bitrate=192):
     return (duration * bitrate) / (8 * 1024)
 
 def get_available_formats(url):
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        # YouTube block කරනවා නම් user-agent fake කරනවා
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-        "referer": "https://www.youtube.com/",
-    }
+    ydl_opts = get_base_ydl_opts()
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            logger.info(f"Fetching info for URL: {url}")
+            logger.info(f"Fetching: {url}")
             info = ydl.extract_info(url, download=False)
             if not info:
-                logger.error("yt-dlp returned empty info")
-                return None, "yt-dlp returned empty response"
+                return None, "Empty response from yt-dlp"
 
             formats = info.get("formats", [])
-
-            # Video-only formats
             video_formats = {}
+            audio_formats = []
+            combined_formats = []
+
             for fmt in formats:
-                if fmt.get("vcodec") != "none" and fmt.get("acodec") == "none":
+                vcodec = fmt.get("vcodec", "none")
+                acodec = fmt.get("acodec", "none")
+
+                if vcodec != "none" and acodec == "none":
                     height = fmt.get("height", 0)
                     ext = fmt.get("ext", "unknown")
                     format_id = fmt.get("format_id", "")
@@ -108,10 +138,7 @@ def get_available_formats(url):
                         })
                         video_formats[quality_key]["actual_heights"].add(height)
 
-            # Audio-only formats
-            audio_formats = []
-            for fmt in formats:
-                if fmt.get("acodec") != "none" and fmt.get("vcodec") == "none":
+                elif acodec != "none" and vcodec == "none":
                     audio_formats.append({
                         "format_id": fmt.get("format_id", ""),
                         "ext": fmt.get("ext", "unknown"),
@@ -119,12 +146,8 @@ def get_available_formats(url):
                         "acodec": fmt.get("acodec", "unknown"),
                         "filesize": fmt.get("filesize") or fmt.get("filesize_approx", 0),
                     })
-            audio_formats.sort(key=lambda x: x["abr"], reverse=True)
 
-            # Combined formats
-            combined_formats = []
-            for fmt in formats:
-                if fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
+                elif vcodec != "none" and acodec != "none":
                     combined_formats.append({
                         "format_id": fmt.get("format_id", ""),
                         "ext": fmt.get("ext", "unknown"),
@@ -132,65 +155,104 @@ def get_available_formats(url):
                         "quality": fmt.get("quality", ""),
                     })
 
-            sorted_video_formats = dict(sorted(video_formats.items(), key=lambda x: parse_quality_key(x[0])))
+            audio_formats.sort(key=lambda x: x["abr"], reverse=True)
+            sorted_video = dict(sorted(video_formats.items(), key=lambda x: parse_quality_key(x[0])))
 
-            result = {
+            return {
                 "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0),
                 "uploader": info.get("uploader", "Unknown"),
                 "thumbnail": info.get("thumbnail", ""),
-                "video_formats": sorted_video_formats,
+                "video_formats": sorted_video,
                 "audio_formats": audio_formats,
                 "combined_formats": combined_formats,
-            }
-            return result, None
+            }, None
 
         except yt_dlp.utils.DownloadError as e:
-            logger.error(f"yt-dlp DownloadError: {str(e)}")
-            return None, f"yt-dlp error: {str(e)}"
+            err = str(e)
+            logger.error(f"yt-dlp error: {err}")
+            if "Sign in to confirm" in err:
+                return None, "YOUTUBE_BOT_DETECTED: YouTube detected bot. Need cookies or PO token. See /docs for setup."
+            return None, f"yt-dlp error: {err}"
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            return None, f"Unexpected error: {str(e)}"
+            logger.error(f"Error: {e}")
+            return None, str(e)
 
 def cleanup_temp(path: str):
     try:
         if os.path.isdir(path):
             shutil.rmtree(path, ignore_errors=True)
-            logger.info(f"Cleaned up: {path}")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
+    except Exception:
+        pass
 
 def sanitize_filename(name):
     return re.sub(r'[^\w\s-]', '', name).strip()
 
-# ==================== API Endpoints ====================
+# ==================== Endpoints ====================
 
 @app.get("/")
 async def root():
     return {
         "status": "running",
         "yt_dlp_version": yt_dlp.version.__version__,
+        "auth_methods": {
+            "cookies_file": os.path.exists(COOKIES_FILE),
+            "po_token": bool(PO_TOKEN),
+            "visitor_data": bool(VISITOR_DATA),
+            "proxy": bool(PROXY_URL),
+        },
         "docs": "/docs",
-        "endpoints": {
-            "formats": "/youtube?url=URL",
-            "video": "/youtube/video?url=URL&quality=QUALITY",
-            "audio": "/youtube/audio?url=URL&quality=QUALITY&type=TYPE",
-            "debug": "/debug?url=URL"
-        }
+        "setup_guide": "/setup"
+    }
+
+@app.get("/setup")
+async def setup_guide():
+    return {
+        "problem": "YouTube detects server IPs as bots and requires authentication",
+        "solutions": [
+            {
+                "method": "PO_TOKEN + VISITOR_DATA (RECOMMENDED)",
+                "description": "Most reliable for servers. No browser needed.",
+                "steps": [
+                    "1. Open YouTube in Chrome browser",
+                    "2. Press F12 → Console tab",
+                    "3. Paste: document.cookie.split(';').find(c => c.trim().startsWith('VISITOR_INFO1_LIVE='))?.split('=')[1]",
+                    "4. Copy the value → set as VISITOR_DATA env var",
+                    "5. For PO Token, use: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#po-token-guide",
+                    "6. Or use: https://github.com/YunzhiYike/yt-dlp-po-token"
+                ],
+                "docker_env": "-e PO_TOKEN=your_token -e VISITOR_DATA=your_visitor_data"
+            },
+            {
+                "method": "Cookies File",
+                "description": "Export cookies from your browser",
+                "steps": [
+                    "1. Install 'Get cookies.txt LOCALLY' Chrome extension",
+                    "2. Go to youtube.com and sign in",
+                    "3. Click extension → Export cookies.txt",
+                    "4. Save as cookies.txt",
+                    "5. Mount to /app/cookies.txt in Docker"
+                ],
+                "docker_volume": "-v $(pwd)/cookies.txt:/app/cookies.txt"
+            },
+            {
+                "method": "Proxy",
+                "description": "Route through residential proxy",
+                "docker_env": "-e PROXY_URL=http://user:pass@proxy:port"
+            }
+        ]
     }
 
 @app.get("/youtube")
 async def get_info(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
-
-    # URL validation basic
     if "youtube.com" not in url and "youtu.be" not in url:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-    info, error_msg = get_available_formats(url)
+    info, error = get_available_formats(url)
     if not info:
-        raise HTTPException(status_code=400, detail=error_msg or "Failed to fetch video info")
+        raise HTTPException(status_code=400, detail=error)
 
     qualities = list(info["video_formats"].keys())
 
@@ -268,63 +330,51 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
     if not url or not quality:
         raise HTTPException(status_code=400, detail="URL and quality are required")
 
-    info, error_msg = get_available_formats(url)
+    info, error = get_available_formats(url)
     if not info:
-        raise HTTPException(status_code=400, detail=error_msg or "Failed to fetch video info")
+        raise HTTPException(status_code=400, detail=error)
 
     temp_dir = f"/tmp/ytdl_{uuid.uuid4().hex}"
     os.makedirs(temp_dir, exist_ok=True)
 
     try:
+        ydl_opts = get_base_ydl_opts()
+        ydl_opts["outtmpl"] = f"{temp_dir}/file.%(ext)s"
+        ydl_opts["noplaylist"] = True
+
         if quality in info["video_formats"]:
             fmt_data = info["video_formats"][quality]
             video_formats = fmt_data["formats"]
             best_video = next((f for f in video_formats if f["ext"] == "mp4"), video_formats[0])
-
-            ydl_opts = {
-                "outtmpl": f"{temp_dir}/file.%(ext)s",
-                "format": f"{best_video['format_id']}+bestaudio/best",
-                "merge_output_format": "mp4",
-                "noplaylist": True,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-            }
+            ydl_opts["format"] = f"{best_video['format_id']}+bestaudio/best"
+            ydl_opts["merge_output_format"] = "mp4"
             display_quality = quality
             ext_hint = ".mp4"
-
         else:
             match = re.match(r'(\d+)p', quality)
             if not match:
                 raise HTTPException(status_code=400, detail=f"Quality '{quality}' not available")
-
             target_height = int(match.group(1))
             best_combined = None
             for fmt in info["combined_formats"]:
                 if map_to_standard_quality(fmt["height"]) == target_height:
                     if not best_combined or fmt["format_id"] > best_combined["format_id"]:
                         best_combined = fmt
-
             if not best_combined:
                 raise HTTPException(status_code=400, detail=f"Quality '{quality}' not available")
-
-            ydl_opts = {
-                "outtmpl": f"{temp_dir}/file.%(ext)s",
-                "format": best_combined["format_id"],
-                "noplaylist": True,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-            }
+            ydl_opts["format"] = best_combined["format_id"]
             display_quality = quality
             ext_hint = f".{best_combined['ext']}"
 
-        logger.info(f"Downloading video with opts: {ydl_opts}")
+        logger.info(f"Downloading video: {ydl_opts}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
         if not files:
-            raise HTTPException(status_code=500, detail="Download failed - no output file")
+            raise HTTPException(status_code=500, detail="Download failed")
 
         downloaded_file = os.path.join(temp_dir, files[0])
-
         safe_title = sanitize_filename(info["title"]).replace(" ", "_")
         ext = os.path.splitext(downloaded_file)[1] or ext_hint
         download_name = f"{safe_title}_{display_quality}{ext}"
@@ -342,8 +392,7 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
         raise
     except Exception as e:
         cleanup_temp(temp_dir)
-        logger.error(f"Video download error: {e}")
-        raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/youtube/audio")
 async def download_audio(
@@ -354,62 +403,51 @@ async def download_audio(
 ):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
-
     if type == "original" and not quality:
-        raise HTTPException(status_code=400, detail="Quality is required for original audio")
+        raise HTTPException(status_code=400, detail="Quality required for original audio")
 
-    info, error_msg = get_available_formats(url)
+    info, error = get_available_formats(url)
     if not info:
-        raise HTTPException(status_code=400, detail=error_msg or "Failed to fetch video info")
+        raise HTTPException(status_code=400, detail=error)
 
     temp_dir = f"/tmp/ytdl_{uuid.uuid4().hex}"
     os.makedirs(temp_dir, exist_ok=True)
 
     try:
+        ydl_opts = get_base_ydl_opts()
+        ydl_opts["outtmpl"] = f"{temp_dir}/file.%(ext)s"
+        ydl_opts["noplaylist"] = True
+
         if type == "mp3":
-            ydl_opts = {
-                "outtmpl": f"{temp_dir}/file.%(ext)s",
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-                "noplaylist": True,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-            }
+            ydl_opts["format"] = "bestaudio/best"
+            ydl_opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
             display_suffix = "192kbps"
             ext_hint = ".mp3"
-
         else:
             selected_audio = None
             for af in info["audio_formats"]:
                 if af["format_id"] == quality or (af["abr"] and str(int(af["abr"])) == quality):
                     selected_audio = af
                     break
-
             if not selected_audio:
                 raise HTTPException(status_code=400, detail=f"Audio quality '{quality}' not available")
-
-            ydl_opts = {
-                "outtmpl": f"{temp_dir}/file.%(ext)s",
-                "format": selected_audio["format_id"],
-                "noplaylist": True,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-            }
+            ydl_opts["format"] = selected_audio["format_id"]
             display_suffix = f"{int(selected_audio['abr']) if selected_audio['abr'] else '?'}kbps"
             ext_hint = f".{selected_audio['ext']}"
 
-        logger.info(f"Downloading audio with opts: {ydl_opts}")
+        logger.info(f"Downloading audio: {ydl_opts}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
         if not files:
-            raise HTTPException(status_code=500, detail="Download failed - no output file")
+            raise HTTPException(status_code=500, detail="Download failed")
 
         downloaded_file = os.path.join(temp_dir, files[0])
-
         safe_title = sanitize_filename(info["title"]).replace(" ", "_")
         ext = os.path.splitext(downloaded_file)[1] or ext_hint
         download_name = f"{safe_title}_{display_suffix}{ext}"
@@ -427,22 +465,16 @@ async def download_audio(
         raise
     except Exception as e:
         cleanup_temp(temp_dir)
-        logger.error(f"Audio download error: {e}")
-        raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
-
-# ==================== Debug Endpoint ====================
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/debug")
 async def debug_ytdl(url: str):
-    """Debug endpoint - exact error message එක පෙන්නනවා"""
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
-
-    ydl_opts = {
-        "quiet": False,
-        "no_warnings": False,
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
-    }
+    
+    ydl_opts = get_base_ydl_opts()
+    ydl_opts["quiet"] = False
+    ydl_opts["no_warnings"] = False
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -451,9 +483,14 @@ async def debug_ytdl(url: str):
                 "success": True,
                 "title": info.get("title"),
                 "duration": info.get("duration"),
-                "uploader": info.get("uploader"),
                 "formats_count": len(info.get("formats", [])),
                 "yt_dlp_version": yt_dlp.version.__version__,
+                "auth_active": {
+                    "cookies": os.path.exists(COOKIES_FILE),
+                    "po_token": bool(PO_TOKEN),
+                    "visitor_data": bool(VISITOR_DATA),
+                    "proxy": bool(PROXY_URL),
+                }
             }
     except Exception as e:
         return {
@@ -461,4 +498,10 @@ async def debug_ytdl(url: str):
             "error": str(e),
             "error_type": type(e).__name__,
             "yt_dlp_version": yt_dlp.version.__version__,
+            "auth_active": {
+                "cookies": os.path.exists(COOKIES_FILE),
+                "po_token": bool(PO_TOKEN),
+                "visitor_data": bool(VISITOR_DATA),
+                "proxy": bool(PROXY_URL),
+            }
         }
