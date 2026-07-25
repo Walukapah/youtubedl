@@ -2,18 +2,22 @@ import os
 import re
 import shutil
 import uuid
+import logging
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
+
+# Logging setup - errors console එකේ පෙන්නනවා
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="YouTube Downloader API",
     description="YouTube Video & Audio Downloader API powered by yt-dlp",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# CORS - Browser එකෙන් call කරන්න පුලුවන්
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,10 +69,18 @@ def get_available_formats(url):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
+        # YouTube block කරනවා නම් user-agent fake කරනවා
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
+        "referer": "https://www.youtube.com/",
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
+            logger.info(f"Fetching info for URL: {url}")
             info = ydl.extract_info(url, download=False)
+            if not info:
+                logger.error("yt-dlp returned empty info")
+                return None, "yt-dlp returned empty response"
+
             formats = info.get("formats", [])
 
             # Video-only formats
@@ -122,7 +134,7 @@ def get_available_formats(url):
 
             sorted_video_formats = dict(sorted(video_formats.items(), key=lambda x: parse_quality_key(x[0])))
 
-            return {
+            result = {
                 "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0),
                 "uploader": info.get("uploader", "Unknown"),
@@ -131,16 +143,22 @@ def get_available_formats(url):
                 "audio_formats": audio_formats,
                 "combined_formats": combined_formats,
             }
+            return result, None
+
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"yt-dlp DownloadError: {str(e)}")
+            return None, f"yt-dlp error: {str(e)}"
         except Exception as e:
-            print(f"Error fetching formats: {e}")
-            return None
+            logger.error(f"Unexpected error: {str(e)}")
+            return None, f"Unexpected error: {str(e)}"
 
 def cleanup_temp(path: str):
     try:
         if os.path.isdir(path):
             shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
+            logger.info(f"Cleaned up: {path}")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
 
 def sanitize_filename(name):
     return re.sub(r'[^\w\s-]', '', name).strip()
@@ -151,11 +169,13 @@ def sanitize_filename(name):
 async def root():
     return {
         "status": "running",
+        "yt_dlp_version": yt_dlp.version.__version__,
         "docs": "/docs",
         "endpoints": {
             "formats": "/youtube?url=URL",
             "video": "/youtube/video?url=URL&quality=QUALITY",
-            "audio": "/youtube/audio?url=URL&quality=QUALITY&type=TYPE"
+            "audio": "/youtube/audio?url=URL&quality=QUALITY&type=TYPE",
+            "debug": "/debug?url=URL"
         }
     }
 
@@ -164,13 +184,16 @@ async def get_info(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
 
-    info = get_available_formats(url)
+    # URL validation basic
+    if "youtube.com" not in url and "youtu.be" not in url:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+
+    info, error_msg = get_available_formats(url)
     if not info:
-        raise HTTPException(status_code=400, detail="Failed to fetch video info. Invalid URL or video unavailable.")
+        raise HTTPException(status_code=400, detail=error_msg or "Failed to fetch video info")
 
     qualities = list(info["video_formats"].keys())
 
-    # Video options (merge video + audio)
     video_options = []
     for q in qualities:
         fmt_data = info["video_formats"][q]
@@ -192,7 +215,6 @@ async def get_info(url: str):
             "note": note
         })
 
-    # Combined options
     combined_seen = set()
     combined_options = []
     for fmt in info["combined_formats"]:
@@ -209,7 +231,6 @@ async def get_info(url: str):
                 })
     combined_options.sort(key=lambda x: x["height"])
 
-    # Audio options
     audio_options = []
     for af in info["audio_formats"]:
         size_mb = af["filesize"] / (1024 * 1024) if af["filesize"] else 0
@@ -222,7 +243,6 @@ async def get_info(url: str):
             "size_mb": round(size_mb, 1) if size_mb > 0 else None,
         })
 
-    # MP3 estimate
     mp3_size = estimate_mp3_size(info.get("duration", 0))
 
     return {
@@ -248,15 +268,14 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
     if not url or not quality:
         raise HTTPException(status_code=400, detail="URL and quality are required")
 
-    info = get_available_formats(url)
+    info, error_msg = get_available_formats(url)
     if not info:
-        raise HTTPException(status_code=400, detail="Failed to fetch video info")
+        raise HTTPException(status_code=400, detail=error_msg or "Failed to fetch video info")
 
     temp_dir = f"/tmp/ytdl_{uuid.uuid4().hex}"
     os.makedirs(temp_dir, exist_ok=True)
 
     try:
-        # 1. Try video-only format (merge with audio)
         if quality in info["video_formats"]:
             fmt_data = info["video_formats"][quality]
             video_formats = fmt_data["formats"]
@@ -267,12 +286,12 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
                 "format": f"{best_video['format_id']}+bestaudio/best",
                 "merge_output_format": "mp4",
                 "noplaylist": True,
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
             }
             display_quality = quality
             ext_hint = ".mp4"
 
         else:
-            # 2. Try combined format
             match = re.match(r'(\d+)p', quality)
             if not match:
                 raise HTTPException(status_code=400, detail=f"Quality '{quality}' not available")
@@ -291,17 +310,18 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
                 "outtmpl": f"{temp_dir}/file.%(ext)s",
                 "format": best_combined["format_id"],
                 "noplaylist": True,
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
             }
             display_quality = quality
             ext_hint = f".{best_combined['ext']}"
 
-        # Download
+        logger.info(f"Downloading video with opts: {ydl_opts}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
         if not files:
-            raise HTTPException(status_code=500, detail="Download failed")
+            raise HTTPException(status_code=500, detail="Download failed - no output file")
 
         downloaded_file = os.path.join(temp_dir, files[0])
 
@@ -322,6 +342,7 @@ async def download_video(url: str, quality: str, background_tasks: BackgroundTas
         raise
     except Exception as e:
         cleanup_temp(temp_dir)
+        logger.error(f"Video download error: {e}")
         raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
 
 @app.get("/youtube/audio")
@@ -337,9 +358,9 @@ async def download_audio(
     if type == "original" and not quality:
         raise HTTPException(status_code=400, detail="Quality is required for original audio")
 
-    info = get_available_formats(url)
+    info, error_msg = get_available_formats(url)
     if not info:
-        raise HTTPException(status_code=400, detail="Failed to fetch video info")
+        raise HTTPException(status_code=400, detail=error_msg or "Failed to fetch video info")
 
     temp_dir = f"/tmp/ytdl_{uuid.uuid4().hex}"
     os.makedirs(temp_dir, exist_ok=True)
@@ -355,12 +376,12 @@ async def download_audio(
                     "preferredquality": "192",
                 }],
                 "noplaylist": True,
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
             }
             display_suffix = "192kbps"
             ext_hint = ".mp3"
 
         else:
-            # Find audio by format_id or bitrate
             selected_audio = None
             for af in info["audio_formats"]:
                 if af["format_id"] == quality or (af["abr"] and str(int(af["abr"])) == quality):
@@ -374,16 +395,18 @@ async def download_audio(
                 "outtmpl": f"{temp_dir}/file.%(ext)s",
                 "format": selected_audio["format_id"],
                 "noplaylist": True,
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
             }
             display_suffix = f"{int(selected_audio['abr']) if selected_audio['abr'] else '?'}kbps"
             ext_hint = f".{selected_audio['ext']}"
 
+        logger.info(f"Downloading audio with opts: {ydl_opts}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
         if not files:
-            raise HTTPException(status_code=500, detail="Download failed")
+            raise HTTPException(status_code=500, detail="Download failed - no output file")
 
         downloaded_file = os.path.join(temp_dir, files[0])
 
@@ -404,4 +427,38 @@ async def download_audio(
         raise
     except Exception as e:
         cleanup_temp(temp_dir)
+        logger.error(f"Audio download error: {e}")
         raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
+
+# ==================== Debug Endpoint ====================
+
+@app.get("/debug")
+async def debug_ytdl(url: str):
+    """Debug endpoint - exact error message එක පෙන්නනවා"""
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+
+    ydl_opts = {
+        "quiet": False,
+        "no_warnings": False,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0",
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                "success": True,
+                "title": info.get("title"),
+                "duration": info.get("duration"),
+                "uploader": info.get("uploader"),
+                "formats_count": len(info.get("formats", [])),
+                "yt_dlp_version": yt_dlp.version.__version__,
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "yt_dlp_version": yt_dlp.version.__version__,
+        }
