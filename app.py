@@ -14,8 +14,26 @@ CORS(app)
 DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', '/tmp/youtube_downloads')
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# ===== COOKIES SETUP =====
+COOKIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+COOKIES_AVAILABLE = os.path.exists(COOKIES_PATH)
 
-# ============ Helper Functions ============
+if COOKIES_AVAILABLE:
+    print(f"✅ Cookies loaded from: {COOKIES_PATH}")
+else:
+    print(f"⚠️ cookies.txt not found at: {COOKIES_PATH}")
+
+
+def get_base_ydl_opts():
+    """Base yt-dlp options with cookies support"""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if COOKIES_AVAILABLE:
+        opts["cookiefile"] = COOKIES_PATH
+    return opts
+
 
 def parse_quality_key(q):
     match = re.match(r'(\d+)p(\d+)?', q)
@@ -58,7 +76,6 @@ def estimate_mp3_size(duration, bitrate=192):
 
 
 def cleanup_file(filepath, delay=300):
-    """Delete file after delay seconds (default 5 min)"""
     def delete():
         time.sleep(delay)
         try:
@@ -70,17 +87,16 @@ def cleanup_file(filepath, delay=300):
 
 
 def get_info(url):
-    ydl_opts = {"quiet": True, "no_warnings": True}
+    ydl_opts = get_base_ydl_opts()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
-
-# ============ Routes ============
 
 @app.route('/')
 def index():
     return jsonify({
         "message": "YouTube Downloader API",
+        "cookies_loaded": COOKIES_AVAILABLE,
         "endpoints": {
             "list_formats": "/youtube?url=<youtube_url>",
             "download_video": "/youtube/video?url=<youtube_url>&quality=<quality>",
@@ -212,7 +228,6 @@ def download_video():
 
     try:
         info = get_info(url)
-        video_id = info.get("id")
         title = info.get("title", "video")
         safe_title = re.sub(r'[^\w\s-]', '', title).strip() or "video"
 
@@ -240,31 +255,32 @@ def download_video():
                         video_match = fmt
 
         download_id = str(uuid.uuid4())
+        base_opts = get_base_ydl_opts()
 
         if combined_match and not video_match:
             ydl_opts = {
+                **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                 'format': combined_match["format_id"],
                 'noplaylist': True,
             }
-            print(f"Downloading combined: {combined_match['format_id']}")
 
         elif video_match:
             ydl_opts = {
+                **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                 'format': f"{video_match['format_id']}+bestaudio/best",
                 'merge_output_format': 'mp4',
                 'noplaylist': True,
             }
-            print(f"Downloading video+merge: {video_match['format_id']}")
 
         else:
             ydl_opts = {
+                **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                 'format': 'best',
                 'noplaylist': True,
             }
-            print("Falling back to best")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -303,9 +319,11 @@ def download_audio():
         safe_title = re.sub(r'[^\w\s-]', '', title).strip() or "audio"
 
         download_id = str(uuid.uuid4())
+        base_opts = get_base_ydl_opts()
 
         if type_.lower() == 'mp3':
             ydl_opts = {
+                **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                 'format': 'bestaudio/best',
                 'postprocessors': [{
@@ -319,12 +337,14 @@ def download_audio():
         else:
             if quality and quality != 'best':
                 ydl_opts = {
+                    **base_opts,
                     'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                     'format': quality,
                     'noplaylist': True,
                 }
             else:
                 ydl_opts = {
+                    **base_opts,
                     'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                     'format': 'bestaudio/best',
                     'noplaylist': True,
