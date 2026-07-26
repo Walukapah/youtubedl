@@ -1,4 +1,4 @@
 Flask==3.0.3
-yt-dlp
+yt-dlp[default]
 flask-cors==4.0.1
 gunicorn==22.0.0
