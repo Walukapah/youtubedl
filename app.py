@@ -106,6 +106,22 @@ def format_duration(seconds):
     return f"{minutes}:{secs:02d}"
 
 
+def format_size_mb(size_mb):
+    """Size එක human readable string එකක් විදියට format කරනවා"""
+    if size_mb is None:
+        return None
+    if size_mb >= 1000:
+        return f"{size_mb/1024:.1f}GB".rstrip('0').rstrip('.') + "GB"
+    return f"{int(size_mb)}MB"
+
+
+def format_audio_quality(abr):
+    """Audio bitrate එක '135kbps' විදියට format කරනවා"""
+    if abr is None:
+        return "0kbps"
+    return f"{int(abr)}kbps"
+
+
 def cleanup_file(filepath, delay=300):
     def delete():
         time.sleep(delay)
@@ -132,8 +148,6 @@ def safe_int(val, default=0):
 
 def get_base_url():
     """API base URL එක generate කරනවා"""
-    # Production එකේ Render/Hugging Face වගේ platform වල
-    # request.host_url use කරනවා
     host = request.host_url.rstrip('/')
     return host
 
@@ -205,6 +219,7 @@ def list_formats():
                 "ext": best.get("ext", "unknown"),
                 "fps": safe_int(best.get("fps"), 30),
                 "size_mb": round(size_mb, 1) if size_mb else None,
+                "size_mb_format": format_size_mb(size_mb) if size_mb else None,
                 "vcodec": best.get("vcodec", "unknown"),
                 "download_url": f"{base_url}/youtube/video?url={url}&quality={q}"
             })
@@ -237,15 +252,18 @@ def list_formats():
                 elif fmt.get("filesize_approx"):
                     size_mb = fmt["filesize_approx"] / (1024 * 1024)
 
+                abr = fmt.get("abr", 0) or 0
                 audio_formats.append({
+                    "quality": abr,
+                    "quality_format": format_audio_quality(abr),
                     "format_id": fmt.get("format_id"),
                     "ext": fmt.get("ext", "unknown"),
-                    "abr": fmt.get("abr", 0) or 0,
                     "acodec": fmt.get("acodec", "unknown"),
                     "size_mb": round(size_mb, 1) if size_mb else None,
+                    "size_mb_format": format_size_mb(size_mb) if size_mb else None,
                     "download_url": f"{base_url}/youtube/audio?url={url}&type=audio"
                 })
-        audio_formats.sort(key=lambda x: x["abr"], reverse=True)
+        audio_formats.sort(key=lambda x: x["quality"], reverse=True)
 
         # ===== MP3 estimate =====
         mp3_size = estimate_mp3_size(duration)
@@ -254,17 +272,21 @@ def list_formats():
             "success": True,
             "video_id": info.get("id"),
             "title": info.get("title"),
-            "duration": duration,
-            "duration_formatted": format_duration(duration),
             "uploader": info.get("uploader"),
             "thumbnail": info.get("thumbnail"),
+            "duration": duration,
+            "duration_formatted": format_duration(duration),
             "formats": {
                 "video": video_qualities,
                 "combined": combined_qualities,
                 "audio": audio_formats,
                 "mp3": {
+                    "quality": 192,
+                    "quality_format": "192kbps",
                     "bitrate": 192,
                     "estimated_size_mb": round(mp3_size, 1) if mp3_size else None,
+                    "size_mb": round(mp3_size, 1) if mp3_size else None,
+                    "size_mb_format": format_size_mb(mp3_size) if mp3_size else None,
                     "download_url": f"{base_url}/youtube/audio?url={url}&type=mp3"
                 }
             }
