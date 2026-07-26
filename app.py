@@ -95,7 +95,6 @@ def estimate_mp3_size(duration, bitrate=192):
 
 
 def format_duration(seconds):
-    """Seconds එක MM:SS හෝ HH:MM:SS විදියට format කරනවා"""
     if not seconds or seconds <= 0:
         return "0:00"
     hours = seconds // 3600
@@ -107,7 +106,6 @@ def format_duration(seconds):
 
 
 def format_size_mb(size_mb):
-    """Size එක human readable string එකක් විදියට format කරනවා"""
     if size_mb is None:
         return None
     if size_mb >= 1000:
@@ -116,7 +114,6 @@ def format_size_mb(size_mb):
 
 
 def format_audio_quality(abr):
-    """Audio bitrate එක '135kbps' විදියට format කරනවා"""
     if abr is None:
         return "0kbps"
     return f"{int(abr)}kbps"
@@ -147,7 +144,6 @@ def safe_int(val, default=0):
 
 
 def get_base_url():
-    """API base URL එක generate කරනවා"""
     host = request.host_url.rstrip('/')
     return host
 
@@ -163,7 +159,7 @@ def index():
         "endpoints": {
             "list_formats": "/youtube?url=<youtube_url>",
             "download_video": "/youtube/video?url=<youtube_url>&quality=<quality>",
-            "download_audio": "/youtube/audio?url=<youtube_url>&type=<mp3|audio>"
+            "download_audio": "/youtube/audio?url=<youtube_url>&quality=<quality>&type=<mp3|m4a|webm>"
         }
     })
 
@@ -172,7 +168,9 @@ def index():
 def list_formats():
     url = request.args.get('url')
     if not url:
-        return jsonify({"success": False, "error": "url parameter is required"}), 400
+        error_data = {"success": False, "error": "url parameter is required"}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=400, mimetype='application/json')
 
     try:
         info = get_info(url)
@@ -273,136 +271,8 @@ def list_formats():
             }
         }
 
-        # Pretty-print JSON response
         response_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         return app.response_class(response_json, mimetype='application/json')
-
-    except Exception as e:
-        error_data = {"success": False, "error": str(e)}
-        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-        return app.response_class(response_json, status=500, mimetype='application/json')
-
-
-@app.route('/youtube/cli-formats')
-def cli_list_formats():
-    url = request.args.get('url')
-    remote_components = request.args.get('remote_components', '')
-
-    if not url:
-        error_data = {"success": False, "error": "url parameter is required"}
-        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-        return app.response_class(response_json, status=400, mimetype='application/json')
-
-    try:
-        args = ['-F', '--dump-json', url]
-
-        if remote_components:
-            args = ['--remote-components', remote_components] + args
-
-        result = run_ytdlp_cli(args)
-
-        if result['returncode'] != 0:
-            error_data = {
-                "success": False,
-                "error": result['stderr'] or result['stdout'],
-                "cmd": result['cmd']
-            }
-            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-            return app.response_class(response_json, status=500, mimetype='application/json')
-
-        lines = result['stdout'].strip().split('\n')
-        formats = []
-        info = None
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                if 'formats' in data:
-                    info = data
-                else:
-                    formats.append(data)
-            except:
-                pass
-
-        response_data = {
-            "success": True,
-            "cli_mode": True,
-            "deno_available": DENO_AVAILABLE,
-            "remote_components": remote_components or None,
-            "info": info,
-            "formats_count": len(formats)
-        }
-        response_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-        return app.response_class(response_json, mimetype='application/json')
-
-    except Exception as e:
-        error_data = {"success": False, "error": str(e)}
-        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-        return app.response_class(response_json, status=500, mimetype='application/json')
-
-
-@app.route('/youtube/cli-download')
-def cli_download():
-    url = request.args.get('url')
-    quality = request.args.get('quality', 'best')
-    remote_components = request.args.get('remote_components', '')
-
-    if not url:
-        error_data = {"success": False, "error": "url parameter is required"}
-        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-        return app.response_class(response_json, status=400, mimetype='application/json')
-
-    try:
-        download_id = str(uuid.uuid4())
-        output_template = os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s')
-
-        args = [
-            '-f', quality,
-            '-o', output_template,
-            '--merge-output-format', 'mp4',
-            '--no-playlist',
-            url
-        ]
-
-        if remote_components:
-            args = ['--remote-components', remote_components] + args
-
-        result = run_ytdlp_cli(args)
-
-        if result['returncode'] != 0:
-            error_data = {
-                "success": False,
-                "error": result['stderr'] or result['stdout'],
-                "cmd": result['cmd']
-            }
-            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-            return app.response_class(response_json, status=500, mimetype='application/json')
-
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
-        if not files:
-            error_data = {"success": False, "error": "Download failed - file not found"}
-            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
-            return app.response_class(response_json, status=500, mimetype='application/json')
-
-        filepath = files[0]
-        actual_ext = os.path.splitext(filepath)[1][1:]
-
-        info_args = ['--print', '%(title)s', url]
-        if COOKIES_AVAILABLE:
-            info_args = ['--cookies', COOKIES_PATH] + info_args
-        info_result = subprocess.run(['yt-dlp'] + info_args, capture_output=True, text=True, timeout=60)
-        title = info_result.stdout.strip() or "video"
-        safe_title = re.sub(r'[^\w\s-]', '', title).strip() or "video"
-
-        cleanup_file(filepath)
-
-        return send_file(
-            filepath,
-            as_attachment=True,
-            download_name=f"{safe_title}.{actual_ext}"
-        )
 
     except Exception as e:
         error_data = {"success": False, "error": str(e)}
@@ -502,7 +372,11 @@ def download_audio():
         download_id = str(uuid.uuid4())
         base_opts = get_base_ydl_opts()
 
-        if type_.lower() == 'mp3':
+        audio_type = type_.lower().strip()
+        print(f"[AUDIO] Requested type: {audio_type}")
+
+        if audio_type == 'mp3':
+            # MP3: convert using FFmpeg
             ydl_opts = {
                 **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
@@ -514,16 +388,46 @@ def download_audio():
                 }],
                 'noplaylist': True,
             }
-            print(f"[AUDIO] Downloading MP3")
+            output_ext = 'mp3'
+            print(f"[AUDIO] Downloading MP3 (converting via FFmpeg)")
+
+        elif audio_type == 'm4a':
+            # M4A: try to get m4a first, if not convert to m4a
+            ydl_opts = {
+                **base_opts,
+                'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'm4a',
+                    'preferredquality': '192',
+                }],
+                'noplaylist': True,
+            }
+            output_ext = 'm4a'
+            print(f"[AUDIO] Downloading M4A (prefer m4a, convert via FFmpeg if needed)")
+
+        elif audio_type == 'webm':
+            # WEBM: try to get webm/opus first, no conversion needed
+            ydl_opts = {
+                **base_opts,
+                'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
+                'format': 'bestaudio[ext=webm]/bestaudio/best',
+                'noplaylist': True,
+            }
+            output_ext = 'webm'
+            print(f"[AUDIO] Downloading WEBM (prefer webm/opus)")
+
         else:
-            # Original audio format (webm, m4a, etc.)
+            # Default / any other type
             ydl_opts = {
                 **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                 'format': 'bestaudio/best',
                 'noplaylist': True,
             }
-            print(f"[AUDIO] Downloading best audio ({type_})")
+            output_ext = audio_type
+            print(f"[AUDIO] Downloading best audio (type={audio_type})")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -537,13 +441,24 @@ def download_audio():
         filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
 
-        print(f"[AUDIO] Downloaded: {filepath}")
+        print(f"[AUDIO] Downloaded: {filepath} (actual ext: {actual_ext}, requested: {output_ext})")
+
+        # If the actual extension doesn't match what user requested, 
+        # and it's not a conversion we already did, rename the file
+        if actual_ext != output_ext and audio_type not in ['mp3', 'm4a']:
+            new_filepath = os.path.splitext(filepath)[0] + f'.{output_ext}'
+            os.rename(filepath, new_filepath)
+            filepath = new_filepath
+            actual_ext = output_ext
+            print(f"[AUDIO] Renamed to: {filepath}")
+
         cleanup_file(filepath)
 
+        # Use the requested type as the download extension
         return send_file(
             filepath,
             as_attachment=True,
-            download_name=f"{safe_title}.{actual_ext}"
+            download_name=f"{safe_title}.{output_ext}"
         )
 
     except Exception as e:
