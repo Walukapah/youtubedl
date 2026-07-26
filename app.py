@@ -26,8 +26,6 @@ else:
     print(f"⚠️ cookies.txt not found at: {COOKIES_PATH}")
 
 # ===== REMOTE COMPONENTS SETUP =====
-# yt-dlp --remote-components ejs:github --cookies cookies.txt -F "vidurl"
-# Deno install කරලා තියෙනවා Dockerfile එකෙන්
 DENO_AVAILABLE = False
 try:
     result = subprocess.run(['deno', '--version'], capture_output=True, text=True, timeout=5)
@@ -51,30 +49,12 @@ def get_base_ydl_opts():
 
 
 def run_ytdlp_cli(args_list):
-    """
-    yt-dlp CLI direct run කරන function එක.
-    --remote-components වගේ CLI-only flags use කරන්න පුළුවන්.
-    Deno install කරලා තියෙනවා නම් remote components work වේවි.
-    """
     cmd = ['yt-dlp']
-
-    # Cookies add කරනවා
     if COOKIES_AVAILABLE:
         cmd.extend(['--cookies', COOKIES_PATH])
-
-    # User arguments add කරනවා
     cmd.extend(args_list)
-
     print(f"[CLI] Running: {' '.join(cmd)}")
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        cwd=DOWNLOAD_DIR
-    )
-
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=DOWNLOAD_DIR)
     return {
         'returncode': result.returncode,
         'stdout': result.stdout,
@@ -97,30 +77,33 @@ def map_to_standard_quality(height):
     closest = min(standard_qualities, key=lambda x: abs(x - height))
     if abs(closest - height) <= 20:
         return closest
-    if height <= 150:
-        return 144
-    elif height <= 280:
-        return 240
-    elif height <= 400:
-        return 360
-    elif height <= 560:
-        return 480
-    elif height <= 800:
-        return 720
-    elif height <= 1200:
-        return 1080
-    elif height <= 1800:
-        return 1440
-    elif height <= 2800:
-        return 2160
-    else:
-        return 4320
+    if height <= 150: return 144
+    elif height <= 280: return 240
+    elif height <= 400: return 360
+    elif height <= 560: return 480
+    elif height <= 800: return 720
+    elif height <= 1200: return 1080
+    elif height <= 1800: return 1440
+    elif height <= 2800: return 2160
+    else: return 4320
 
 
 def estimate_mp3_size(duration, bitrate=192):
     if not duration or duration <= 0:
         return None
     return (duration * bitrate) / (8 * 1024)
+
+
+def format_duration(seconds):
+    """Seconds එක MM:SS හෝ HH:MM:SS විදියට format කරනවා"""
+    if not seconds or seconds <= 0:
+        return "0:00"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def cleanup_file(filepath, delay=300):
@@ -145,6 +128,14 @@ def safe_int(val, default=0):
         return int(val) if val is not None else default
     except (ValueError, TypeError):
         return default
+
+
+def get_base_url():
+    """API base URL එක generate කරනවා"""
+    # Production එකේ Render/Hugging Face වගේ platform වල
+    # request.host_url use කරනවා
+    host = request.host_url.rstrip('/')
+    return host
 
 
 # ============ Routes ============
@@ -173,6 +164,8 @@ def list_formats():
     try:
         info = get_info(url)
         formats = info.get("formats", [])
+        base_url = get_base_url()
+        duration = info.get("duration", 0)
 
         # ===== Video-only formats =====
         video_formats = {}
@@ -212,7 +205,8 @@ def list_formats():
                 "ext": best.get("ext", "unknown"),
                 "fps": safe_int(best.get("fps"), 30),
                 "size_mb": round(size_mb, 1) if size_mb else None,
-                "vcodec": best.get("vcodec", "unknown")
+                "vcodec": best.get("vcodec", "unknown"),
+                "download_url": f"{base_url}/youtube/video?url={url}&quality={q}"
             })
 
         # ===== Combined formats =====
@@ -228,7 +222,8 @@ def list_formats():
                         combined_qualities.append({
                             "quality": f"{std_h}p",
                             "format_id": fmt.get("format_id"),
-                            "ext": fmt.get("ext", "unknown")
+                            "ext": fmt.get("ext", "unknown"),
+                            "download_url": f"{base_url}/youtube/video?url={url}&quality={std_h}p"
                         })
         combined_qualities.sort(key=lambda x: parse_quality_key(x["quality"]))
 
@@ -247,12 +242,12 @@ def list_formats():
                     "ext": fmt.get("ext", "unknown"),
                     "abr": fmt.get("abr", 0) or 0,
                     "acodec": fmt.get("acodec", "unknown"),
-                    "size_mb": round(size_mb, 1) if size_mb else None
+                    "size_mb": round(size_mb, 1) if size_mb else None,
+                    "download_url": f"{base_url}/youtube/audio?url={url}&type=audio"
                 })
         audio_formats.sort(key=lambda x: x["abr"], reverse=True)
 
         # ===== MP3 estimate =====
-        duration = info.get("duration", 0)
         mp3_size = estimate_mp3_size(duration)
 
         return jsonify({
@@ -260,6 +255,7 @@ def list_formats():
             "video_id": info.get("id"),
             "title": info.get("title"),
             "duration": duration,
+            "duration_formatted": format_duration(duration),
             "uploader": info.get("uploader"),
             "thumbnail": info.get("thumbnail"),
             "formats": {
@@ -268,7 +264,8 @@ def list_formats():
                 "audio": audio_formats,
                 "mp3": {
                     "bitrate": 192,
-                    "estimated_size_mb": round(mp3_size, 1) if mp3_size else None
+                    "estimated_size_mb": round(mp3_size, 1) if mp3_size else None,
+                    "download_url": f"{base_url}/youtube/audio?url={url}&type=mp3"
                 }
             }
         })
@@ -277,15 +274,8 @@ def list_formats():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# ============ NEW: CLI-based routes with --remote-components support ============
-
 @app.route('/youtube/cli-formats')
 def cli_list_formats():
-    """
-    yt-dlp CLI direct use කරලා formats list කරන endpoint එක.
-    --remote-components support තියෙනවා.
-    Example: /youtube/cli-formats?url=URL&remote_components=ejs:github
-    """
     url = request.args.get('url')
     remote_components = request.args.get('remote_components', '')
 
@@ -295,7 +285,6 @@ def cli_list_formats():
     try:
         args = ['-F', '--dump-json', url]
 
-        # Remote components add කරනවා
         if remote_components:
             args = ['--remote-components', remote_components] + args
 
@@ -308,7 +297,6 @@ def cli_list_formats():
                 "cmd": result['cmd']
             }), 500
 
-        # Parse JSON lines
         lines = result['stdout'].strip().split('\n')
         formats = []
         info = None
@@ -340,11 +328,6 @@ def cli_list_formats():
 
 @app.route('/youtube/cli-download')
 def cli_download():
-    """
-    yt-dlp CLI direct use කරලා download කරන endpoint එක.
-    --remote-components support තියෙනවා.
-    Example: /youtube/cli-download?url=URL&quality=720p&remote_components=ejs:github
-    """
     url = request.args.get('url')
     quality = request.args.get('quality', 'best')
     remote_components = request.args.get('remote_components', '')
@@ -364,7 +347,6 @@ def cli_download():
             url
         ]
 
-        # Remote components add කරනවා
         if remote_components:
             args = ['--remote-components', remote_components] + args
 
@@ -384,7 +366,6 @@ def cli_download():
         filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
 
-        # Title extract කරනවා info එකෙන්
         info_args = ['--print', '%(title)s', url]
         if COOKIES_AVAILABLE:
             info_args = ['--cookies', COOKIES_PATH] + info_args
@@ -419,16 +400,12 @@ def download_video():
         download_id = str(uuid.uuid4())
         base_opts = get_base_ydl_opts()
 
-        # Extract height from quality string (e.g., "720p" -> 720, "720p60" -> 720)
         target_height, _ = parse_quality_key(quality)
         if target_height == 0:
-            # Fallback: try to extract digits
             digits = re.findall(r'\d+', quality)
             if digits:
                 target_height = int(digits[0])
 
-        # ===== ROBUST FORMAT SELECTOR =====
-        # Try combined format first (most reliable), then separate streams, then fallback
         if target_height > 0:
             format_selector = (
                 f"best[height={target_height}]/"
@@ -506,7 +483,6 @@ def download_audio():
             }
             print(f"[AUDIO] Downloading MP3")
         else:
-            # Original audio format (m4a, webm, etc.)
             ydl_opts = {
                 **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
