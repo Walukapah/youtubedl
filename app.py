@@ -7,6 +7,8 @@ import glob
 import uuid
 import threading
 import time
+import subprocess
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -23,6 +25,20 @@ if COOKIES_AVAILABLE:
 else:
     print(f"⚠️ cookies.txt not found at: {COOKIES_PATH}")
 
+# ===== REMOTE COMPONENTS SETUP =====
+# yt-dlp --remote-components ejs:github --cookies cookies.txt -F "vidurl"
+# Deno install කරලා තියෙනවා Dockerfile එකෙන්
+DENO_AVAILABLE = False
+try:
+    result = subprocess.run(['deno', '--version'], capture_output=True, text=True, timeout=5)
+    if result.returncode == 0:
+        DENO_AVAILABLE = True
+        print(f"✅ Deno available: {result.stdout.strip().split(chr(10))[0]}")
+    else:
+        print("⚠️ Deno not available")
+except Exception as e:
+    print(f"⚠️ Deno check failed: {e}")
+
 
 def get_base_ydl_opts():
     opts = {
@@ -32,6 +48,39 @@ def get_base_ydl_opts():
     if COOKIES_AVAILABLE:
         opts["cookiefile"] = COOKIES_PATH
     return opts
+
+
+def run_ytdlp_cli(args_list):
+    """
+    yt-dlp CLI direct run කරන function එක.
+    --remote-components වගේ CLI-only flags use කරන්න පුළුවන්.
+    Deno install කරලා තියෙනවා නම් remote components work වේවි.
+    """
+    cmd = ['yt-dlp']
+
+    # Cookies add කරනවා
+    if COOKIES_AVAILABLE:
+        cmd.extend(['--cookies', COOKIES_PATH])
+
+    # User arguments add කරනවා
+    cmd.extend(args_list)
+
+    print(f"[CLI] Running: {' '.join(cmd)}")
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=DOWNLOAD_DIR
+    )
+
+    return {
+        'returncode': result.returncode,
+        'stdout': result.stdout,
+        'stderr': result.stderr,
+        'cmd': ' '.join(cmd)
+    }
 
 
 def parse_quality_key(q):
@@ -105,10 +154,12 @@ def index():
     return jsonify({
         "message": "YouTube Downloader API",
         "cookies_loaded": COOKIES_AVAILABLE,
+        "deno_available": DENO_AVAILABLE,
         "endpoints": {
             "list_formats": "/youtube?url=<youtube_url>",
             "download_video": "/youtube/video?url=<youtube_url>&quality=<quality>",
-            "download_audio": "/youtube/audio?url=<youtube_url>&type=<mp3|audio>"
+            "download_audio": "/youtube/audio?url=<youtube_url>&type=<mp3|audio>",
+            "cli_formats": "/youtube/cli-formats?url=<youtube_url>&remote_components=<optional>"
         }
     })
 
@@ -221,6 +272,133 @@ def list_formats():
                 }
             }
         })
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============ NEW: CLI-based routes with --remote-components support ============
+
+@app.route('/youtube/cli-formats')
+def cli_list_formats():
+    """
+    yt-dlp CLI direct use කරලා formats list කරන endpoint එක.
+    --remote-components support තියෙනවා.
+    Example: /youtube/cli-formats?url=URL&remote_components=ejs:github
+    """
+    url = request.args.get('url')
+    remote_components = request.args.get('remote_components', '')
+
+    if not url:
+        return jsonify({"success": False, "error": "url parameter is required"}), 400
+
+    try:
+        args = ['-F', '--dump-json', url]
+
+        # Remote components add කරනවා
+        if remote_components:
+            args = ['--remote-components', remote_components] + args
+
+        result = run_ytdlp_cli(args)
+
+        if result['returncode'] != 0:
+            return jsonify({
+                "success": False,
+                "error": result['stderr'] or result['stdout'],
+                "cmd": result['cmd']
+            }), 500
+
+        # Parse JSON lines
+        lines = result['stdout'].strip().split('\n')
+        formats = []
+        info = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if 'formats' in data:
+                    info = data
+                else:
+                    formats.append(data)
+            except:
+                pass
+
+        return jsonify({
+            "success": True,
+            "cli_mode": True,
+            "deno_available": DENO_AVAILABLE,
+            "remote_components": remote_components or None,
+            "info": info,
+            "formats_count": len(formats)
+        })
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/youtube/cli-download')
+def cli_download():
+    """
+    yt-dlp CLI direct use කරලා download කරන endpoint එක.
+    --remote-components support තියෙනවා.
+    Example: /youtube/cli-download?url=URL&quality=720p&remote_components=ejs:github
+    """
+    url = request.args.get('url')
+    quality = request.args.get('quality', 'best')
+    remote_components = request.args.get('remote_components', '')
+
+    if not url:
+        return jsonify({"success": False, "error": "url parameter is required"}), 400
+
+    try:
+        download_id = str(uuid.uuid4())
+        output_template = os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s')
+
+        args = [
+            '-f', quality,
+            '-o', output_template,
+            '--merge-output-format', 'mp4',
+            '--no-playlist',
+            url
+        ]
+
+        # Remote components add කරනවා
+        if remote_components:
+            args = ['--remote-components', remote_components] + args
+
+        result = run_ytdlp_cli(args)
+
+        if result['returncode'] != 0:
+            return jsonify({
+                "success": False,
+                "error": result['stderr'] or result['stdout'],
+                "cmd": result['cmd']
+            }), 500
+
+        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
+        if not files:
+            return jsonify({"success": False, "error": "Download failed - file not found"}), 500
+
+        filepath = files[0]
+        actual_ext = os.path.splitext(filepath)[1][1:]
+
+        # Title extract කරනවා info එකෙන්
+        info_args = ['--print', '%(title)s', url]
+        if COOKIES_AVAILABLE:
+            info_args = ['--cookies', COOKIES_PATH] + info_args
+        info_result = subprocess.run(['yt-dlp'] + info_args, capture_output=True, text=True, timeout=60)
+        title = info_result.stdout.strip() or "video"
+        safe_title = re.sub(r'[^\w\s-]', '', title).strip() or "video"
+
+        cleanup_file(filepath)
+
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name=f"{safe_title}.{actual_ext}"
+        )
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
