@@ -163,8 +163,7 @@ def index():
         "endpoints": {
             "list_formats": "/youtube?url=<youtube_url>",
             "download_video": "/youtube/video?url=<youtube_url>&quality=<quality>",
-            "download_audio": "/youtube/audio?url=<youtube_url>&type=<mp3|audio>",
-            "cli_formats": "/youtube/cli-formats?url=<youtube_url>&remote_components=<optional>"
+            "download_audio": "/youtube/audio?url=<youtube_url>&type=<mp3|audio>"
         }
     })
 
@@ -224,24 +223,6 @@ def list_formats():
                 "download_url": f"{base_url}/youtube/video?url={url}&quality={q}"
             })
 
-        # ===== Combined formats =====
-        combined_seen = set()
-        combined_qualities = []
-        for fmt in formats:
-            if fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
-                h = fmt.get("height", 0)
-                if h and h > 0:
-                    std_h = map_to_standard_quality(h)
-                    if std_h not in combined_seen:
-                        combined_seen.add(std_h)
-                        combined_qualities.append({
-                            "quality": f"{std_h}p",
-                            "format_id": fmt.get("format_id"),
-                            "ext": fmt.get("ext", "unknown"),
-                            "download_url": f"{base_url}/youtube/video?url={url}&quality={std_h}p"
-                        })
-        combined_qualities.sort(key=lambda x: parse_quality_key(x["quality"]))
-
         # ===== Audio formats =====
         audio_formats = []
         for fmt in formats:
@@ -253,22 +234,23 @@ def list_formats():
                     size_mb = fmt["filesize_approx"] / (1024 * 1024)
 
                 abr = fmt.get("abr", 0) or 0
+                ext = fmt.get("ext", "unknown")
                 audio_formats.append({
                     "quality": abr,
                     "quality_format": format_audio_quality(abr),
                     "format_id": fmt.get("format_id"),
-                    "ext": fmt.get("ext", "unknown"),
+                    "ext": ext,
                     "acodec": fmt.get("acodec", "unknown"),
                     "size_mb": round(size_mb, 1) if size_mb else None,
                     "size_mb_format": format_size_mb(size_mb) if size_mb else None,
-                    "download_url": f"{base_url}/youtube/audio?url={url}&type=audio"
+                    "download_url": f"{base_url}/youtube/audio?url={url}&quality={format_audio_quality(abr)}&type={ext}"
                 })
         audio_formats.sort(key=lambda x: x["quality"], reverse=True)
 
         # ===== MP3 estimate =====
         mp3_size = estimate_mp3_size(duration)
 
-        return jsonify({
+        response_data = {
             "success": True,
             "video_id": info.get("id"),
             "title": info.get("title"),
@@ -278,7 +260,6 @@ def list_formats():
             "duration_formatted": format_duration(duration),
             "formats": {
                 "video": video_qualities,
-                "combined": combined_qualities,
                 "audio": audio_formats,
                 "mp3": {
                     "quality": 192,
@@ -287,13 +268,19 @@ def list_formats():
                     "estimated_size_mb": round(mp3_size, 1) if mp3_size else None,
                     "size_mb": round(mp3_size, 1) if mp3_size else None,
                     "size_mb_format": format_size_mb(mp3_size) if mp3_size else None,
-                    "download_url": f"{base_url}/youtube/audio?url={url}&type=mp3"
+                    "download_url": f"{base_url}/youtube/audio?url={url}&quality=192kbps&type=mp3"
                 }
             }
-        })
+        }
+
+        # Pretty-print JSON response
+        response_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, mimetype='application/json')
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        error_data = {"success": False, "error": str(e)}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=500, mimetype='application/json')
 
 
 @app.route('/youtube/cli-formats')
@@ -302,7 +289,9 @@ def cli_list_formats():
     remote_components = request.args.get('remote_components', '')
 
     if not url:
-        return jsonify({"success": False, "error": "url parameter is required"}), 400
+        error_data = {"success": False, "error": "url parameter is required"}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=400, mimetype='application/json')
 
     try:
         args = ['-F', '--dump-json', url]
@@ -313,11 +302,13 @@ def cli_list_formats():
         result = run_ytdlp_cli(args)
 
         if result['returncode'] != 0:
-            return jsonify({
+            error_data = {
                 "success": False,
                 "error": result['stderr'] or result['stdout'],
                 "cmd": result['cmd']
-            }), 500
+            }
+            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+            return app.response_class(response_json, status=500, mimetype='application/json')
 
         lines = result['stdout'].strip().split('\n')
         formats = []
@@ -335,17 +326,21 @@ def cli_list_formats():
             except:
                 pass
 
-        return jsonify({
+        response_data = {
             "success": True,
             "cli_mode": True,
             "deno_available": DENO_AVAILABLE,
             "remote_components": remote_components or None,
             "info": info,
             "formats_count": len(formats)
-        })
+        }
+        response_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, mimetype='application/json')
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        error_data = {"success": False, "error": str(e)}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=500, mimetype='application/json')
 
 
 @app.route('/youtube/cli-download')
@@ -355,7 +350,9 @@ def cli_download():
     remote_components = request.args.get('remote_components', '')
 
     if not url:
-        return jsonify({"success": False, "error": "url parameter is required"}), 400
+        error_data = {"success": False, "error": "url parameter is required"}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=400, mimetype='application/json')
 
     try:
         download_id = str(uuid.uuid4())
@@ -375,15 +372,19 @@ def cli_download():
         result = run_ytdlp_cli(args)
 
         if result['returncode'] != 0:
-            return jsonify({
+            error_data = {
                 "success": False,
                 "error": result['stderr'] or result['stdout'],
                 "cmd": result['cmd']
-            }), 500
+            }
+            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+            return app.response_class(response_json, status=500, mimetype='application/json')
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
         if not files:
-            return jsonify({"success": False, "error": "Download failed - file not found"}), 500
+            error_data = {"success": False, "error": "Download failed - file not found"}
+            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+            return app.response_class(response_json, status=500, mimetype='application/json')
 
         filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
@@ -404,7 +405,9 @@ def cli_download():
         )
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        error_data = {"success": False, "error": str(e)}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=500, mimetype='application/json')
 
 
 @app.route('/youtube/video')
@@ -413,7 +416,9 @@ def download_video():
     quality = request.args.get('quality')
 
     if not url or not quality:
-        return jsonify({"success": False, "error": "url and quality parameters are required"}), 400
+        error_data = {"success": False, "error": "url and quality parameters are required"}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=400, mimetype='application/json')
 
     try:
         info = get_info(url)
@@ -457,7 +462,9 @@ def download_video():
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
         if not files:
-            return jsonify({"success": False, "error": "Download failed - file not found"}), 500
+            error_data = {"success": False, "error": "Download failed - file not found"}
+            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+            return app.response_class(response_json, status=500, mimetype='application/json')
 
         filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
@@ -473,7 +480,9 @@ def download_video():
 
     except Exception as e:
         print(f"[VIDEO] ERROR: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        error_data = {"success": False, "error": str(e)}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=500, mimetype='application/json')
 
 
 @app.route('/youtube/audio')
@@ -482,7 +491,9 @@ def download_audio():
     type_ = request.args.get('type', 'mp3')
 
     if not url:
-        return jsonify({"success": False, "error": "url parameter is required"}), 400
+        error_data = {"success": False, "error": "url parameter is required"}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=400, mimetype='application/json')
 
     try:
         info = get_info(url)
@@ -505,20 +516,23 @@ def download_audio():
             }
             print(f"[AUDIO] Downloading MP3")
         else:
+            # Original audio format (webm, m4a, etc.)
             ydl_opts = {
                 **base_opts,
                 'outtmpl': os.path.join(DOWNLOAD_DIR, f'{download_id}.%(ext)s'),
                 'format': 'bestaudio/best',
                 'noplaylist': True,
             }
-            print(f"[AUDIO] Downloading best audio")
+            print(f"[AUDIO] Downloading best audio ({type_})")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{download_id}.*"))
         if not files:
-            return jsonify({"success": False, "error": "Download failed - file not found"}), 500
+            error_data = {"success": False, "error": "Download failed - file not found"}
+            response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+            return app.response_class(response_json, status=500, mimetype='application/json')
 
         filepath = files[0]
         actual_ext = os.path.splitext(filepath)[1][1:]
@@ -534,7 +548,9 @@ def download_audio():
 
     except Exception as e:
         print(f"[AUDIO] ERROR: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        error_data = {"success": False, "error": str(e)}
+        response_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        return app.response_class(response_json, status=500, mimetype='application/json')
 
 
 if __name__ == '__main__':
